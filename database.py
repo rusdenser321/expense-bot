@@ -19,12 +19,18 @@ async def init_db():
         await db.commit()
 
 
-async def add_transaction(user_id: int, amount: float, category: str) -> int:
+async def add_transaction(user_id: int, amount: float, category: str, date: str = None) -> int:
     async with aiosqlite.connect(DB_PATH) as db:
-        cursor = await db.execute(
-            "INSERT INTO transactions (user_id, amount, category) VALUES (?, ?, ?)",
-            (user_id, amount, category),
-        )
+        if date:
+            cursor = await db.execute(
+                "INSERT INTO transactions (user_id, amount, category, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, amount, category, date),
+            )
+        else:
+            cursor = await db.execute(
+                "INSERT INTO transactions (user_id, amount, category) VALUES (?, ?, ?)",
+                (user_id, amount, category),
+            )
         await db.commit()
         return cursor.lastrowid
 

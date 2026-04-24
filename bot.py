@@ -172,35 +172,119 @@ async def cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Запись #{tx_id} не найдена.")
 
 
+# ── AI agent system prompt ────────────────────────────────────────────────────
+
+def build_system_prompt(today: str, balance: float, history: list) -> str:
+    history_lines = []
+    for tx_id, amount, category, created_at in history:
+        arrow = "📈" if amount > 0 else "📉"
+        history_lines.append(f"  #{tx_id} {arrow} {abs(amount):.2f}€ — {category} ({created_at[:10]})")
+    history_text = "\n".join(history_lines) if history_lines else "  (пусто)"
+
+    return f"""Ты — персональный финансовый ассистент в Telegram. Сегодня {today}.
+Текущий баланс пользователя: {balance:.2f}€
+
+Последние операции:
+{history_text}
+
+Твоя задача — понять что хочет пользователь из его сообщения на естественном языке.
+
+Пользователь может:
+- Сказать о трате: "потратил 50 на кофе", "вчера был обед 30 евро", "неделю назад заплатил 200 за кафе"
+- Сказать о доходе: "получил зарплату 2000", "пришло 500 от клиента"
+- Спросить баланс или статистику: "сколько у меня?", "что за неделю?"
+- Установить начальный баланс: "у меня сейчас 5000 евро", "начальный баланс 10000"
+- Просто поговорить или задать вопрос
+
+Правила обработки дат:
+- "вчера" = {today} минус 1 день
+- "неделю назад" = {today} минус 7 дней
+- "позавчера" = {today} минус 2 дня
+- Если дата не указана — используй сегодня
+
+Ответь ТОЛЬКО JSON без пояснений, в одном из форматов:
+
+Если есть транзакция для записи:
+{{"reply": "текст ответа пользователю", "transaction": {{"amount": -50.0, "category": "кофе", "date": "2026-04-24"}}}}
+
+Если транзакции нет (вопрос, разговор, статистика):
+{{"reply": "текст ответа пользователю", "transaction": null}}
+
+Правила:
+- amount отрицательный для трат, положительный для доходов
+- date в формате YYYY-MM-DD
+- reply — живой, дружелюбный, на русском, 1-2 предложения
+- Для вопросов о балансе/статистике — reply содержит ответ, transaction null
+- НЕ оборачивай в markdown блок, только чистый JSON"""
+
+
 # ── text message handler ──────────────────────────────────────────────────────
 
 @only_owner
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-    m = re.match(r'^([+\-]?\d+(?:[.,]\d{1,2})?)\s*(.*)$', text)
-    if not m:
+    uid = update.effective_user.id
+
+    # Fallback regex if no AI
+    if not ai_client:
+        m = re.match(r'^([+\-]?\d+(?:[.,]\d{1,2})?)\s*(.*)$', text)
+        if not m:
+            await update.message.reply_text(
+                "Не понял 🤔 Напиши, например:\n`50 кофе` или `+1500 зарплата`",
+                parse_mode="Markdown",
+            )
+            return
+        raw = float(m.group(1).replace(",", "."))
+        category = m.group(2).strip() or "прочее"
+        is_income = text.startswith("+")
+        stored = raw if is_income else -abs(raw)
+        tx_id = await database.add_transaction(uid, stored, category)
+        bal = await database.get_balance(uid)
+        label, arrow = ("Доход", "📈") if is_income else ("Трата", "📉")
         await update.message.reply_text(
-            "Не понял 🤔 Напиши, например:\n`50 кофе` или `+1500 зарплата`\n"
-            "Или скинь фото чека.",
+            f"{arrow} {label}: *{fmt(abs(raw))}* — {category}\n_#{tx_id} · Баланс: {fmt(bal)}_",
             parse_mode="Markdown",
         )
         return
 
-    raw = float(m.group(1).replace(",", "."))
-    category = m.group(2).strip() or "прочее"
-    is_income = text.startswith("+")
-    stored = raw if is_income else -abs(raw)
+    # AI path
+    today = date.today().isoformat()
+    balance = await database.get_balance(uid)
+    history = await database.get_history(uid, 10)
+    system_prompt = build_system_prompt(today, balance, history)
 
-    uid = update.effective_user.id
-    tx_id = await database.add_transaction(uid, stored, category)
-    bal = await database.get_balance(uid)
+    try:
+        response = await ai_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=512,
+            system=system_prompt,
+            messages=[{"role": "user", "content": text}],
+        )
+        raw_json = response.content[0].text.strip()
+        raw_json = re.sub(r"^```[a-z]*\n?", "", raw_json)
+        raw_json = re.sub(r"\n?```$", "", raw_json)
+        parsed = json.loads(raw_json)
+    except Exception as e:
+        logger.error("AI text parse error: %s", e)
+        await update.message.reply_text("Что-то пошло не так 😕 Попробуй ещё раз.")
+        return
 
-    label, arrow = ("Доход", "📈") if is_income else ("Трата", "📉")
-    await update.message.reply_text(
-        f"{arrow} {label}: *{fmt(abs(raw))}* — {category}\n"
-        f"_#{tx_id} · Баланс: {fmt(bal)}_",
-        parse_mode="Markdown",
-    )
+    reply_text = parsed.get("reply", "")
+    tx = parsed.get("transaction")
+
+    if tx:
+        amount = float(tx["amount"])
+        category = str(tx.get("category", "прочее"))
+        tx_date = tx.get("date")
+        tx_id = await database.add_transaction(uid, amount, category, tx_date)
+        bal = await database.get_balance(uid)
+        arrow = "📈" if amount > 0 else "📉"
+        await update.message.reply_text(
+            f"{arrow} {reply_text}\n_#{tx_id} · Баланс: {fmt(bal)}_",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text(reply_text or "Понял 👍")
 
 
 # ── photo handler (Claude Vision) ─────────────────────────────────────────────

@@ -86,12 +86,35 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  `15.50 обед` — с копейками\n\n"
         "Фото: просто отправь снимок чека или экрана оплаты.\n\n"
         "Команды:\n"
+        "  /setbalance 10000 — задать начальный баланс\n"
         "  /balance — текущий баланс\n"
         "  /week — итог этой недели\n"
         "  /stats — итог месяца\n"
         "  /history — последние 10 операций\n"
         "  /del 5 — удалить запись №5",
         parse_mode="Markdown",
+    )
+
+
+@only_owner
+async def cmd_setbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "Укажи сумму: `/setbalance 10000`\n"
+            "Это установит начальный баланс — используй один раз в начале.",
+            parse_mode="Markdown"
+        )
+        return
+    try:
+        amount = float(context.args[0].replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("Неверная сумма. Пример: `/setbalance 10000`", parse_mode="Markdown")
+        return
+    uid = update.effective_user.id
+    tx_id = await database.add_transaction(uid, amount, "начальный баланс")
+    await update.message.reply_text(
+        f"✅ Начальный баланс установлен: *{fmt(amount)}*\n_#{tx_id}_",
+        parse_mode="Markdown"
     )
 
 
@@ -322,6 +345,7 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("setbalance", cmd_setbalance))
     app.add_handler(CommandHandler("balance", cmd_balance))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("stats", cmd_stats))
